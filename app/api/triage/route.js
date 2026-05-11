@@ -1,39 +1,55 @@
-// ARJE /get-help triage relay — v1.2 (Day 3 multipart parser fix)
+// ARJE /get-help triage relay — v1.3 (Day 3 multipart-wrapped rawRequest fix)
 // Jotform form 261278593405059 → POST /api/triage → SendGrid Dynamic Templates
 //
+// v1.3 changes (May 10, 2026 — Phase 6.3 third iteration):
+//   - DIAGNOSED: Jotform actually sends a HYBRID payload — the wire format
+//     is multipart/form-data (per v1.2 diagnosis), but inside that multipart
+//     payload there is ONE part named `rawRequest` whose value is a JSON
+//     string containing all the actual form fields. The other multipart
+//     parts (`formID`, `submissionID`, `pretty`) are envelope metadata.
+//   - v1.2's multipart branch correctly extracted the parts but treated
+//     `rawRequest` as just another flat key, never unwrapping it as a JSON
+//     envelope. Result: all canonical fields resolved to EMPTY for the
+//     second time at the 17:59 UTC + 23:49 UTC live windows.
+//   - Diagnostic confirmation via Vercel MCP keyword probes (May 10, 23:55 UTC):
+//       query="compound parents" → matched → multipart branch fired ✓
+//       query="rawRequest"       → matched → rawRequest IS a multipart part ✓
+//       query="q1_businessName"  → no match → fields not at multipart root ✓
+//     Together these confirm: multipart parser ran, rawRequest is a part,
+//     canonical field IDs are NOT direct multipart parts.
+//   - The fix: inside the multipart branch, after building `flat` from
+//     multipart parts, check if flat.rawRequest is a JSON string and
+//     unwrap it into `inner` — same logic the v1.1 urlencoded fallback
+//     path already has. Net code addition: ~12 lines inside the multipart
+//     branch.
+//   - extractFields requires no change — it already prefers `parsed.inner`
+//     over `parsed.flat` when both exist (per v1.1 behavior).
+//
 // v1.2 changes (May 10, 2026 — Phase 6.3 second iteration):
-//   - DIAGNOSED: Jotform's actual webhook content-type is multipart/form-data,
-//     NOT application/x-www-form-urlencoded as v1.1 assumed. The 10:59 AM
-//     PT submission landed at the relay with a multipart boundary as the
-//     entire body; URLSearchParams treated the boundary line as a single
-//     key, resulting in all-EMPTY canonical fields.
-//   - parseJotformBody now detects multipart/form-data via the content-type
-//     header and uses the Web-standard Request.formData() API (Node 20
-//     native) to parse properly. Compound name fields (q4_yourName[first],
-//     q4_yourName[last]) are reconstructed from separate multipart parts.
-//   - rawRequest envelope path is preserved as fallback (in case Jotform's
-//     webhook config changes or some sends use the URL-encoded path).
-//   - JSON content-type path is preserved for manual curl tests.
+//   - parseJotformBody added multipart/form-data as primary path via
+//     Request.formData(). Compound name fields (q4_yourName[first]/[last])
+//     reconstructed into nested objects. Did not unwrap rawRequest inside
+//     multipart — that's v1.3's job.
 //
 // v1.1 changes (May 10, 2026 — Phase 6.3 first iteration):
 //   - parseJotformBody unwrapped Jotform's `rawRequest` JSON-string envelope
-//     (assumption that turned out to be wrong for multipart sends; kept as
-//     fallback).
+//     under urlencoded path. Assumption that content-type was urlencoded
+//     turned out wrong (it's multipart). Kept as fallback in v1.2+.
 //   - FIELD_MAP updated to q{N}_{questionname} format.
 //   - Compound fields (yourName.first/.last) flattened during extraction.
 //   - Verbose diagnostic logging added.
 //
 // Architecture:
 //   1. Receive Jotform's webhook POST (multipart/form-data — primary path)
-//   2. Parse via Request.formData() → flat object with multipart fields
-//      Compound names flattened: q4_yourName[first] + q4_yourName[last]
-//      → q4_yourName: { first: "...", last: "..." } for extractor compatibility
-//   3. Map raw fields to canonical names via FIELD_FALLBACKS
-//   4. Bot rejection: if honeypot field has any value, return 200 OK silently
-//   5. Triage: compute bucket (A/B/C/D) from canonical fields
-//   6. Fire internal notification (Template 1) with all fields + triage_bucket
-//   7. Fire customer-facing template (2/3/4/5 based on bucket)
-//   8. Return 200 OK to Jotform
+//   2. Parse via Request.formData() → flat object with multipart parts
+//   3. Check if flat.rawRequest exists as JSON string → unwrap to inner
+//   4. extractFields reads inner first (where the real fields live),
+//      falls back to flat (envelope metadata)
+//   5. Bot rejection: if honeypot field has any value, return 200 OK silently
+//   6. Triage: compute bucket (A/B/C/D) from canonical fields
+//   7. Fire internal notification (Template 1) with all fields + triage_bucket
+//   8. Fire customer-facing template (2/3/4/5 based on bucket)
+//   9. Return 200 OK to Jotform
 //
 // On any error: log to Vercel runtime logs, return 200 OK to Jotform anyway
 // (so Jotform doesn't queue retry storms — we'd rather lose the email than dupe it)
@@ -158,7 +174,26 @@ async function parseJotformBody(req) {
       'flat keys:', Object.keys(flat).join(','),
       '| compound parents:', Object.keys(compounds).join(',') || 'none')
 
-    return { source: 'multipart', flat, inner: null }
+    // v1.3 FIX: Jotform multipart payloads contain a `rawRequest` part whose
+    // value is a JSON string of the actual form fields. Unwrap it here so
+    // extractFields sees the inner field object, not just envelope metadata
+    // (formID / submissionID / pretty / rawRequest at the multipart root).
+    let inner = null
+    if (typeof flat.rawRequest === 'string' && flat.rawRequest.trim().length > 0) {
+      try {
+        inner = JSON.parse(flat.rawRequest)
+        console.log('[get-help-triage] body parse: multipart contained rawRequest envelope,',
+          'inner keys:', Object.keys(inner).join(','))
+      } catch (parseErr) {
+        console.error('[get-help-triage] multipart rawRequest JSON parse failed:',
+          parseErr.message,
+          '\n  rawRequest first 500 chars:',
+          flat.rawRequest.slice(0, 500))
+        inner = null
+      }
+    }
+
+    return { source: inner ? 'multipart+rawRequest' : 'multipart', flat, inner }
   }
 
   // Path 2: application/json (likely a manual test POST, not Jotform)
@@ -440,7 +475,7 @@ export async function GET() {
   return new Response(JSON.stringify({
     ok:        true,
     service:   'ARJE /get-help triage relay',
-    version:   '1.2.0',
+    version:   '1.3.0',
     buckets:   ['hot_cleanup', 'warm_recurring', 'discovery', 'selfserve'],
     timestamp: new Date().toISOString(),
   }), {
