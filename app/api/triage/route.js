@@ -1,5 +1,5 @@
-// ARJE /get-help triage relay — v1.3 (Day 3 multipart-wrapped rawRequest fix)
-// Jotform form 261278593405059 → POST /api/triage → SendGrid Dynamic Templates
+// ARJE /get-help triage relay — v1.4 (May 22, 2026 — schema-delta FIELD_MAP rebuild)
+// Jotform form 261375188338062 → POST /api/triage → SendGrid Dynamic Templates
 //
 // v1.3 changes (May 10, 2026 — Phase 6.3 third iteration):
 //   - DIAGNOSED: Jotform actually sends a HYBRID payload — the wire format
@@ -63,32 +63,35 @@ export const runtime = 'nodejs'
 // Compound fields (full name) have nested subkeys: `q4_yourName.first`.
 // ──────────────────────────────────────────────────────────────────────
 const FIELD_MAP = {
-  // Canonical name      →  Jotform rawRequest key
-  business_name:           'q1_businessName',
-  contact_name:            'q4_yourName',          // compound: .first .last
-  contact_email:           'q3_emailAddress',
-  industry:                'q5_whatIndustry',
-  industry_other:          'q6_industry_other',
-  current_state:           'q7_whereAre',
-  months_behind:           'q8_howMany',
-  monthly_volume:          'q10_monthlyTransaction',
-  service_need:            'q11_service_need',
-  honeypot:                'q15_website_url',
+  // Canonical name      →  Jotform rawRequest key (form 261375188338062)
+  // Note: FIELD_MAP is informational only — actual resolution uses FIELD_FALLBACKS below.
+  first_name:              'q2_q2_textbox0',
+  last_name:               'q3_q3_textbox1',
+  business_name:           'q10_businessName',
+  contact_email:           'q4_q4_email2',
+  phone:                   'q5_q5_phone3',
+  industry:                'q6_q6_dropdown4',
+  months_behind:           'q7_q7_number5',
+  monthly_volume:          'q11_approximateMonthly',
+  service_need:            'q12_whatYoure',
+  blocker:                 'q8_q8_textarea6',
+  honeypot:                'website',
 }
 
 // Fallback aliases — if Jotform sends `pretty` keys or alternate shapes,
 // we still resolve. Keys checked in order; first non-empty wins.
 const FIELD_FALLBACKS = {
-  business_name:   ['q1_businessName', 'businessName', 'Business Name'],
-  contact_name:    ['q4_yourName', 'yourName', 'Your Name'],
-  contact_email:   ['q3_emailAddress', 'emailAddress', 'Email Address', 'email'],
-  industry:        ['q5_whatIndustry', 'whatIndustry', 'What Industry'],
-  industry_other:  ['q6_industry_other', 'industry_other'],
-  current_state:   ['q7_whereAre', 'whereAre', 'Where Are You'],
-  months_behind:   ['q8_howMany', 'howMany', 'How Many Months'],
-  monthly_volume:  ['q10_monthlyTransaction', 'monthlyTransaction', 'Monthly Transactions'],
-  service_need:    ['q11_service_need', 'service_need', 'Service Need'],
-  honeypot:        ['q15_website_url', 'website_url'],
+  first_name:      ['q2_q2_textbox0', 'q2_firstName', 'firstName'],
+  last_name:       ['q3_q3_textbox1', 'q3_lastName', 'lastName'],
+  business_name:   ['q10_businessName', 'businessName'],
+  contact_email:   ['q4_q4_email2', 'q4_email', 'email'],
+  phone:           ['q5_q5_phone3', 'q5_phone', 'phone'],
+  industry:        ['q6_q6_dropdown4', 'q6_businessType', 'businessType'],
+  months_behind:   ['q7_q7_number5', 'q7_monthsBehind', 'monthsBehind'],
+  monthly_volume:  ['q11_approximateMonthly', 'monthlyVolume'],
+  service_need:    ['q12_whatYoure', 'q12_whatYouLookingFor', 'serviceNeed'],
+  blocker:         ['q8_q8_textarea6', 'q8_blocker', 'blocker'],
+  honeypot:        ['website', 'q15_website_url'],
 }
 
 // SendGrid Dynamic Template IDs (locked from Phase 4, May 9)
@@ -276,6 +279,12 @@ function extractFields(parsed) {
     out[canonical] = value
   }
 
+  // Post-extraction derivation: contact_name from split first/last fields.
+  // The form schema split the original compound name field into two separate
+  // top-level fields. Join here so downstream code expecting contact_name
+  // continues to work without modification.
+  out.contact_name = [out.first_name, out.last_name].filter(Boolean).join(' ').trim()
+
   return out
 }
 
@@ -369,14 +378,17 @@ export async function POST(req) {
     //     dial back after Phase 6.4 production ENABLE)
     console.log('[get-help-triage] resolved fields:', JSON.stringify({
       source:          parsed.source,
+      first_name:      fields.first_name      ? '✓' : 'EMPTY',
+      last_name:       fields.last_name       ? '✓' : 'EMPTY',
       business_name:   fields.business_name   ? '✓' : 'EMPTY',
       contact_name:    fields.contact_name    ? '✓' : 'EMPTY',
       contact_email:   fields.contact_email   ? '✓' : 'EMPTY',
+      phone:           fields.phone           ? '✓' : 'EMPTY',
       industry:        fields.industry        ? '✓' : 'EMPTY',
-      current_state:   fields.current_state   ? '✓' : 'EMPTY',
       months_behind:   fields.months_behind   ? '✓' : 'EMPTY',
       monthly_volume:  fields.monthly_volume  ? '✓' : 'EMPTY',
       service_need:    fields.service_need    ? '✓' : 'EMPTY',
+      blocker:         fields.blocker         ? '✓' : 'EMPTY',
       honeypot:        fields.honeypot        ? '⚠️ FILLED' : 'empty (good)',
     }))
 
