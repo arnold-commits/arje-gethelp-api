@@ -434,6 +434,7 @@ export async function POST(req) {
       const customerConfig = TEMPLATE_CONFIG[triage.key]
       const customerData = {
         contact_name:  fields.contact_name  || 'there',
+        first_name:    fields.first_name    || 'there',
         business_name: fields.business_name || 'your business',
         months_behind: fields.months_behind || '',
       }
