@@ -76,8 +76,8 @@ const FIELD_MAP = {
   service_need:            'q12_whatYoure',
   blocker:                 'q8_q8_textarea6',
   honeypot:                'website',
-  'q13_whatsThe': 'current_state',
-  'q14_pleaseTell': 'business_type_other',
+  current_state:       'q13_whatsThe',
+  business_type_other: 'q14_pleaseTell',
 }
 
 // Fallback aliases — if Jotform sends `pretty` keys or alternate shapes,
@@ -94,8 +94,8 @@ const FIELD_FALLBACKS = {
   service_need:    ['q12_whatYoure', 'q12_whatYouLookingFor', 'serviceNeed'],
   blocker:         ['q8_q8_textarea6', 'q8_blocker', 'blocker'],
   honeypot:        ['website', 'q15_website_url'],
-  current_state: 'Not specified',
-  business_type_other: '',
+  current_state:       ['q13_whatsThe'],
+  business_type_other: ['q14_pleaseTell'],
 }
 
 // SendGrid Dynamic Template IDs (locked from Phase 4, May 9)
