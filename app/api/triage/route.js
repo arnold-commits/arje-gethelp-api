@@ -1,5 +1,20 @@
-// ARJE /get-help triage relay — v1.4 (May 22, 2026 — schema-delta FIELD_MAP rebuild)
+// ARJE /get-help triage relay — v1.5 (May 29, 2026 — customer-send deliverability fix)
 // Jotform form 261375188338062 → POST /api/triage → SendGrid Dynamic Templates
+//
+// v1.5 changes (May 29, 2026 — Phase B deliverability):
+//   - Customer autoresponder was landing in Gmail Promotions, not Primary.
+//   - Root cause: code set NO tracking_settings on either send, so SendGrid
+//     account-level Mail Settings (open + click tracking) applied globally —
+//     injecting the open pixel + link-rewriting that read as "marketing."
+//   - Fix: sendTemplate now accepts an optional `trackingSettings` param.
+//     The CUSTOMER send passes it to disable open/click/subscription tracking
+//     for that send only. The INTERNAL triage send omits it → account default
+//     applies → internal pixel left intact (unchanged behavior).
+//   - No header/asm/categories changes needed — code never set any. The only
+//     bulk artifact risk (List-Unsubscribe footer) comes from account-level
+//     subscription tracking, neutralized by subscription_tracking.enable=false
+//     on the customer send.
+//   - GET version bumped 1.3.0 → 1.5.0 (also closes the stale-version cleanup item).
 //
 // v1.3 changes (May 10, 2026 — Phase 6.3 third iteration):
 //   - DIAGNOSED: Jotform actually sends a HYBRID payload — the wire format
@@ -125,6 +140,17 @@ const TEMPLATE_CONFIG = {
 const FROM_EMAIL    = 'arnold@arjebookkeeping.com'
 const REPLY_TO      = 'arnold@arjebookkeeping.com'
 const INTERNAL_TO   = 'arnold@arjebookkeeping.com'
+
+// ──────────────────────────────────────────────────────────────────────
+// Per-send tracking override for the CUSTOMER autoresponder (v1.5).
+// Disables SendGrid open pixel, click-rewriting, and the unsubscribe footer
+// for the customer send only, so Gmail classifies it as a 1:1 reply (Primary)
+// rather than marketing (Promotions). Internal triage send does NOT use this.
+const CUSTOMER_TRACKING_OFF = {
+  click_tracking:        { enable: false, enable_text: false },
+  open_tracking:         { enable: false },
+  subscription_tracking: { enable: false },
+}
 
 // ──────────────────────────────────────────────────────────────────────
 // Body parser — Jotform webhook envelope handling
@@ -331,8 +357,10 @@ function computeTriage(fields) {
 
 // ──────────────────────────────────────────────────────────────────────
 // SendGrid mail/send caller
+//   trackingSettings (optional): when provided, sets per-send tracking_settings,
+//   overriding SendGrid account-level Mail Settings for THIS send only.
 // ──────────────────────────────────────────────────────────────────────
-async function sendTemplate({ to, templateId, fromName, dynamicData }) {
+async function sendTemplate({ to, templateId, fromName, dynamicData, trackingSettings }) {
   const apiKey = process.env.SENDGRID_API_KEY
   if (!apiKey) {
     throw new Error('SENDGRID_API_KEY env var not set')
@@ -346,6 +374,12 @@ async function sendTemplate({ to, templateId, fromName, dynamicData }) {
     from: { email: FROM_EMAIL, name: fromName },
     reply_to: { email: REPLY_TO },
     template_id: templateId,
+  }
+
+  // v1.5: per-send tracking override (customer send only). Omitting this on the
+  // internal send leaves SendGrid account-level tracking in place for it.
+  if (trackingSettings) {
+    body.tracking_settings = trackingSettings
   }
 
   const response = await fetch('https://api.sendgrid.com/v3/mail/send', {
@@ -430,6 +464,8 @@ export async function POST(req) {
       templateId:  TEMPLATE_CONFIG.internal.id,
       fromName:    TEMPLATE_CONFIG.internal.from_name,
       dynamicData: internalData,
+      // NOTE: no trackingSettings → internal triage send keeps account-level
+      // tracking (pixel intact). Intentional per v1.5.
     })
 
     // 6. Fire customer-facing template (only if we have a valid contact email)
@@ -448,6 +484,7 @@ export async function POST(req) {
         templateId:  customerConfig.id,
         fromName:    customerConfig.from_name,
         dynamicData: customerData,
+        trackingSettings: CUSTOMER_TRACKING_OFF,   // v1.5: keep customer reply in Primary
       })
       customerResult = { sent: true, template: triage.key }
     }
@@ -492,7 +529,7 @@ export async function GET() {
   return new Response(JSON.stringify({
     ok:        true,
     service:   'ARJE /get-help triage relay',
-    version:   '1.3.0',
+    version:   '1.5.0',
     buckets:   ['hot_cleanup', 'warm_recurring', 'discovery', 'selfserve'],
     timestamp: new Date().toISOString(),
   }), {
