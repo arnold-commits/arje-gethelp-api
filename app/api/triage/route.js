@@ -294,6 +294,8 @@ function extractFields(parsed) {
         if (typeof raw === 'object') {
           if (raw.first || raw.last) {
             value = [raw.first, raw.last].filter(Boolean).join(' ').trim()
+          } else if (raw.full) {
+            value = String(raw.full).trim()
           } else {
             value = JSON.stringify(raw)
           }
