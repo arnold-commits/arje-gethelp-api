@@ -1,4 +1,4 @@
-// ARJE /get-help triage relay — v1.5 (May 29, 2026 — customer-send deliverability fix)
+// ARJE /get-help triage relay — v1.6 (June 13, 2026 — selfserve override resequence)
 // Jotform form 261375188338062 → POST /api/triage → SendGrid Dynamic Templates
 //
 // v1.5 changes (May 29, 2026 — Phase B deliverability):
@@ -15,6 +15,13 @@
 //     subscription tracking, neutralized by subscription_tracking.enable=false
 //     on the customer send.
 //   - GET version bumped 1.3.0 → 1.5.0 (also closes the stale-version cleanup item).
+//
+// v1.6 changes (June 13, 2026):
+//   - Resequence: months-behind override now precedes the selfserve (D) branch.
+//     Safety property — a fit lead (>=3 months behind) cannot route to selfserve,
+//     even with an explicit DIY ask. Behavior-preserving for the current form
+//     (D cannot fire until the Jotform DIY option exists).
+//   - Header bumped to v1.6 (consolidates the previously-uncommitted .full phone branch).
 //
 // v1.3 changes (May 10, 2026 — Phase 6.3 third iteration):
 //   - DIAGNOSED: Jotform actually sends a HYBRID payload — the wire format
@@ -328,27 +335,34 @@ function extractFields(parsed) {
 // Bucket D (selfserve):      explicitly wants templates/DIY tools
 // ──────────────────────────────────────────────────────────────────────
 function computeTriage(fields) {
-  const need = (fields.service_need || '').toLowerCase()
-  const state = (fields.current_state || '').toLowerCase()
+  const need   = (fields.service_need || '').toLowerCase()
+  const state  = (fields.current_state || '').toLowerCase()
   const months = (fields.months_behind || '').toLowerCase()
 
-  // D — self-serve signal first (explicit DIY ask)
+  const behindSignals = ['3','4','5','6','7','8','9','10','11','12','+','year']
+
+  // A OVERRIDE — months behind >= 3 forces hot_cleanup REGARDLESS of service
+  // preference, including an explicit DIY ask. Safety property: a fit lead
+  // cannot route to selfserve. MUST precede the D check. (v1.6)
+  if (behindSignals.some(s => months.includes(s))) {
+    return { key: 'hot_cleanup', label: 'A — Hot Cleanup' }
+  }
+
+  // D — self-serve signal (explicit DIY ask). State-signals stay BELOW this:
+  // never-set-up + DIY is a legitimate selfserve profile.
   if (need.includes('template') || need.includes('diy') || need.includes('self')) {
     return { key: 'selfserve', label: 'D — Self-serve' }
   }
 
-  // A — cleanup signal: shoebox/spreadsheet state OR 3+ months behind
+  // A — cleanup signal: shoebox/spreadsheet state OR cleanup-need ask
+  // (months handled by the override above)
   const cleanupSignals = ['cleanup', 'clean up', 'catch up', 'catch-up', 'behind']
   const stateSignals   = ['shoebox', 'spreadsheet', 'nothing']
-  const behindSignals  = ['3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '+', 'year']
-
-  if (cleanupSignals.some(s => need.includes(s)) ||
-      stateSignals.some(s => state.includes(s)) ||
-      behindSignals.some(s => months.includes(s))) {
+  if (cleanupSignals.some(s => need.includes(s)) || stateSignals.some(s => state.includes(s))) {
     return { key: 'hot_cleanup', label: 'A — Hot Cleanup' }
   }
 
-  // B — warm recurring: explicit monthly/ongoing ask
+  // B — warm recurring
   if (need.includes('month') || need.includes('ongoing') || need.includes('recurring')) {
     return { key: 'warm_recurring', label: 'B — Warm Recurring' }
   }
