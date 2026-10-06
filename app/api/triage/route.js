@@ -1,5 +1,20 @@
-// ARJE /get-help triage relay — v1.6 (June 13, 2026 — selfserve override resequence)
-// Jotform form 261375188338062 → POST /api/triage → SendGrid Dynamic Templates
+// ARJE /get-help triage relay — v1.7 (October 6, 2026 — send through Gmail)
+// Jotform form 261375188338062 → POST /api/triage → Gmail SMTP (arnold@arjebookkeeping.com)
+//
+// v1.7 changes (October 6, 2026):
+//   - SendGrid's Email API trial ended October 1, 2026 ("End of Access"), so
+//     every send since then failed — silently, because errors are caught and
+//     Jotform still gets a 200. Sending moves to Gmail SMTP as the Workspace
+//     account itself, authenticated with an app password in GMAIL_APP_PASSWORD.
+//   - The five SendGrid Dynamic Templates are copied verbatim into
+//     ./templates.js and rendered here (renderTemplate). Form values are
+//     HTML-escaped in the HTML part, as SendGrid's Handlebars did.
+//   - The internal and customer sends are now independent: a failed internal
+//     notification no longer stops the customer reply (and vice versa).
+//   - The customer address must be ONE plain address. Gmail would honour a
+//     comma list typed into the form; SendGrid's single-recipient body did not.
+//   - Tracking settings removed — Gmail adds no pixel or link rewriting.
+//   - GET version bumped 1.5.0 → 1.7.0.
 //
 // v1.5 changes (May 29, 2026 — Phase B deliverability):
 //   - Customer autoresponder was landing in Gmail Promotions, not Primary.
@@ -69,12 +84,16 @@
 //      falls back to flat (envelope metadata)
 //   5. Bot rejection: if honeypot field has any value, return 200 OK silently
 //   6. Triage: compute bucket (A/B/C/D) from canonical fields
-//   7. Fire internal notification (Template 1) with all fields + triage_bucket
-//   8. Fire customer-facing template (2/3/4/5 based on bucket)
+//   7. Send internal notification (template `internal`) with all fields + triage_bucket
+//   8. Send customer-facing template (hot_cleanup/warm_recurring/discovery/selfserve)
+//      — independent of step 7's outcome (v1.7)
 //   9. Return 200 OK to Jotform
 //
 // On any error: log to Vercel runtime logs, return 200 OK to Jotform anyway
 // (so Jotform doesn't queue retry storms — we'd rather lose the email than dupe it)
+
+import nodemailer from 'nodemailer'
+import { TEMPLATES } from './templates'
 
 export const runtime = 'nodejs'
 
@@ -120,44 +139,19 @@ const FIELD_FALLBACKS = {
   business_type_other: ['q14_pleaseTell'],
 }
 
-// SendGrid Dynamic Template IDs (locked from Phase 4, May 9)
-const TEMPLATE_CONFIG = {
-  internal: {
-    id:        'd-e9b2ff3b71464aaebcd359a75ff6e4e9',
-    from_name: 'ARJE /get-help triage',
-  },
-  hot_cleanup: {
-    id:        'd-437300a3dc434cf6bc9b59d37585f2e6',
-    from_name: 'Arnold Dizon | ARJE Bookkeeping',
-  },
-  warm_recurring: {
-    id:        'd-e8e068117636450d8c3e6c8e95718114',
-    from_name: 'Arnold Dizon | ARJE Bookkeeping',
-  },
-  discovery: {
-    id:        'd-beada329ad014da2aa3acd76f87333c9',
-    from_name: 'Arnold Dizon | ARJE Bookkeeping',
-  },
-  selfserve: {
-    id:        'd-aa60f167c5fc4fc183da5a68935fe5e0',
-    from_name: 'Arnold Dizon | ARJE Bookkeeping',
-  },
+// Sender display names per template (carried over from the v1.6 SendGrid config).
+// Template bodies live in ./templates.js (verbatim copies of the SendGrid templates).
+const FROM_NAMES = {
+  internal:       'ARJE /get-help triage',
+  hot_cleanup:    'Arnold Dizon | ARJE Bookkeeping',
+  warm_recurring: 'Arnold Dizon | ARJE Bookkeeping',
+  discovery:      'Arnold Dizon | ARJE Bookkeeping',
+  selfserve:      'Arnold Dizon | ARJE Bookkeeping',
 }
 
 const FROM_EMAIL    = 'arnold@arjebookkeeping.com'
 const REPLY_TO      = 'arnold@arjebookkeeping.com'
 const INTERNAL_TO   = 'arnold@arjebookkeeping.com'
-
-// ──────────────────────────────────────────────────────────────────────
-// Per-send tracking override for the CUSTOMER autoresponder (v1.5).
-// Disables SendGrid open pixel, click-rewriting, and the unsubscribe footer
-// for the customer send only, so Gmail classifies it as a 1:1 reply (Primary)
-// rather than marketing (Promotions). Internal triage send does NOT use this.
-const CUSTOMER_TRACKING_OFF = {
-  click_tracking:        { enable: false, enable_text: false },
-  open_tracking:         { enable: false },
-  subscription_tracking: { enable: false },
-}
 
 // ──────────────────────────────────────────────────────────────────────
 // Body parser — Jotform webhook envelope handling
@@ -372,47 +366,88 @@ function computeTriage(fields) {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// SendGrid mail/send caller
-//   trackingSettings (optional): when provided, sets per-send tracking_settings,
-//   overriding SendGrid account-level Mail Settings for THIS send only.
+// Template rendering (v1.7) — the Handlebars subset the SendGrid templates use:
+//   {{#if name}}…{{else}}…{{/if}}  (not nested; empty string = false)
+//   {{name}}                        (HTML-escaped in the HTML part)
+// Blocks resolve first, against the template text only; values are then
+// substituted in one pass, so a form value containing "{{…}}" is never
+// re-interpreted.
 // ──────────────────────────────────────────────────────────────────────
-async function sendTemplate({ to, templateId, fromName, dynamicData, trackingSettings }) {
-  const apiKey = process.env.SENDGRID_API_KEY
-  if (!apiKey) {
-    throw new Error('SENDGRID_API_KEY env var not set')
+const HTML_ESCAPES = {
+  '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;',
+  "'": '&#x27;', '`': '&#x60;', '=': '&#x3D;',
+}
+
+function escapeHtml(value) {
+  return value.replace(/[&<>"'`=]/g, ch => HTML_ESCAPES[ch])
+}
+
+function renderTemplate(template, data, { escape }) {
+  const valueOf = key => {
+    const v = data[key]
+    return v === undefined || v === null ? '' : String(v)
   }
 
-  const body = {
-    personalizations: [{
-      to: [{ email: to }],
-      dynamic_template_data: dynamicData,
-    }],
-    from: { email: FROM_EMAIL, name: fromName },
-    reply_to: { email: REPLY_TO },
-    template_id: templateId,
+  const withBlocks = template.replace(
+    /\{\{#if\s+(\w+)\s*\}\}([\s\S]*?)(?:\{\{else\}\}([\s\S]*?))?\{\{\/if\}\}/g,
+    (_, key, ifTrue, ifFalse = '') => (valueOf(key) ? ifTrue : ifFalse)
+  )
+
+  return withBlocks.replace(/\{\{\s*(\w+)\s*\}\}/g,
+    (_, key) => (escape ? escapeHtml(valueOf(key)) : valueOf(key)))
+}
+
+// One plain address only — no lists, no display names, no header characters.
+function isSingleAddress(value) {
+  return /^[^\s@,;<>"()\[\]\\]+@[^\s@,;<>"()\[\]\\]+\.[^\s@,;<>"()\[\]\\]+$/.test(value)
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Gmail SMTP sender (v1.7). Authenticates as FROM_EMAIL with the app password
+// in GMAIL_APP_PASSWORD. Timeouts are short so a stalled connection fails
+// inside the function's time limit instead of hanging it.
+// ──────────────────────────────────────────────────────────────────────
+let transporter = null
+
+function getTransporter() {
+  const pass = process.env.GMAIL_APP_PASSWORD
+  if (!pass) {
+    throw new Error('GMAIL_APP_PASSWORD env var not set')
   }
 
-  // v1.5: per-send tracking override (customer send only). Omitting this on the
-  // internal send leaves SendGrid account-level tracking in place for it.
-  if (trackingSettings) {
-    body.tracking_settings = trackingSettings
+  if (!transporter) {
+    transporter = nodemailer.createTransport({
+      host:              'smtp.gmail.com',
+      port:              465,
+      secure:            true,
+      auth:              { user: FROM_EMAIL, pass },
+      connectionTimeout: 8000,
+      greetingTimeout:   8000,
+      socketTimeout:     10000,
+    })
+  }
+  return transporter
+}
+
+async function sendEmail({ to, templateKey, data }) {
+  const template = TEMPLATES[templateKey]
+  if (!template) {
+    throw new Error(`unknown template: ${templateKey}`)
   }
 
-  const response = await fetch('https://api.sendgrid.com/v3/mail/send', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
+  // Subject is a header: no escaping, but never let a value add a line break.
+  const subject = renderTemplate(template.subject, data, { escape: false }).replace(/[\r\n]+/g, ' ')
+
+  const info = await getTransporter().sendMail({
+    from:    { name: FROM_NAMES[templateKey], address: FROM_EMAIL },
+    replyTo: REPLY_TO,
+    to,
+    subject,
+    html:    renderTemplate(template.html, data, { escape: true }),
+    text:    renderTemplate(template.text, data, { escape: false }),
   })
 
-  if (!response.ok) {
-    const errText = await response.text()
-    throw new Error(`SendGrid mail/send failed: ${response.status} — ${errText}`)
-  }
-
-  return { ok: true, status: response.status }
+  return { ok: true, messageId: info.messageId }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -475,19 +510,23 @@ export async function POST(req) {
       timestamp_utc:  new Date().toISOString(),
     }
 
-    await sendTemplate({
-      to:          INTERNAL_TO,
-      templateId:  TEMPLATE_CONFIG.internal.id,
-      fromName:    TEMPLATE_CONFIG.internal.from_name,
-      dynamicData: internalData,
-      // NOTE: no trackingSettings → internal triage send keeps account-level
-      // tracking (pixel intact). Intentional per v1.5.
-    })
+    // v1.7: each send has its own try/catch, so one failure cannot block the other.
+    let internalResult
+    try {
+      await sendEmail({ to: INTERNAL_TO, templateKey: 'internal', data: internalData })
+      internalResult = 'sent'
+    } catch (sendErr) {
+      console.error('[get-help-triage] internal send failed:', sendErr.message, sendErr.stack)
+      internalResult = 'failed'
+    }
 
-    // 6. Fire customer-facing template (only if we have a valid contact email)
+    // 6. Send customer-facing template (only to a single valid contact address)
     let customerResult = { skipped: true, reason: 'no contact_email' }
-    if (fields.contact_email && fields.contact_email.includes('@')) {
-      const customerConfig = TEMPLATE_CONFIG[triage.key]
+    if (fields.contact_email && !isSingleAddress(fields.contact_email)) {
+      customerResult = { skipped: true, reason: 'contact_email not a single address' }
+      console.log('[get-help-triage] customer send skipped — contact_email rejected:',
+        JSON.stringify({ contact_email: fields.contact_email, submission_id: submissionId }))
+    } else if (fields.contact_email) {
       const customerData = {
         contact_name:  fields.contact_name  || 'there',
         first_name:    fields.first_name    || 'there',
@@ -495,28 +534,30 @@ export async function POST(req) {
         months_behind: fields.months_behind || '',
       }
 
-      await sendTemplate({
-        to:          fields.contact_email,
-        templateId:  customerConfig.id,
-        fromName:    customerConfig.from_name,
-        dynamicData: customerData,
-        trackingSettings: CUSTOMER_TRACKING_OFF,   // v1.5: keep customer reply in Primary
-      })
-      customerResult = { sent: true, template: triage.key }
+      try {
+        await sendEmail({ to: fields.contact_email, templateKey: triage.key, data: customerData })
+        customerResult = { sent: true, template: triage.key }
+      } catch (sendErr) {
+        console.error('[get-help-triage] customer send failed:', sendErr.message, sendErr.stack)
+        customerResult = { sent: false, template: triage.key, reason: 'send failed — see logs' }
+      }
     }
 
     const elapsed = Date.now() - startTime
-    console.log('[get-help-triage] success:', JSON.stringify({
+    const allOk = internalResult === 'sent' && customerResult.sent !== false
+    console.log(`[get-help-triage] ${allOk ? 'success' : 'completed with send failure'}:`, JSON.stringify({
       bucket:         triage.key,
       contact_email:  fields.contact_email,
       submission_id:  submissionId,
+      internal:       internalResult,
+      customer:       customerResult,
       elapsed_ms:     elapsed,
     }))
 
     return new Response(JSON.stringify({
-      ok:         true,
+      ok:         allOk,
       bucket:     triage.key,
-      internal:   'sent',
+      internal:   internalResult,
       customer:   customerResult,
       elapsed_ms: elapsed,
     }), {
@@ -545,7 +586,7 @@ export async function GET() {
   return new Response(JSON.stringify({
     ok:        true,
     service:   'ARJE /get-help triage relay',
-    version:   '1.5.0',
+    version:   '1.7.0',
     buckets:   ['hot_cleanup', 'warm_recurring', 'discovery', 'selfserve'],
     timestamp: new Date().toISOString(),
   }), {
