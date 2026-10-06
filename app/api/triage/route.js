@@ -1,4 +1,4 @@
-// ARJE /get-help triage relay — v1.7 (October 6, 2026 — send through Gmail)
+// ARJE /get-help triage relay — v1.7.1 (October 6, 2026 — new phone number in templates)
 // Jotform form 261375188338062 → POST /api/triage → Gmail SMTP (arnold@arjebookkeeping.com)
 //
 // v1.7 changes (October 6, 2026):
@@ -586,7 +586,7 @@ export async function GET() {
   return new Response(JSON.stringify({
     ok:        true,
     service:   'ARJE /get-help triage relay',
-    version:   '1.7.0',
+    version:   '1.7.1',
     buckets:   ['hot_cleanup', 'warm_recurring', 'discovery', 'selfserve'],
     timestamp: new Date().toISOString(),
   }), {
